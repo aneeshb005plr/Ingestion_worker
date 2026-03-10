@@ -1,0 +1,47 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ingestion-worker — Python 3.13
+# Last updated: Feb 25 2026
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Queue & Task Runner ───────────────────────────────────────────────────────
+arq>=0.26.0                         # ARQ worker — async job queue on Redis
+
+# ── Data Validation ───────────────────────────────────────────────────────────
+pydantic>=2.9.0
+pydantic-settings>=2.6.0            # reads .env into Settings class
+
+# ── Database ──────────────────────────────────────────────────────────────────
+pymongo>=4.10.0                     # AsyncMongoClient (native async, tz_aware support)
+
+# ── Logging & Resilience ──────────────────────────────────────────────────────
+structlog>=24.4.0                   # structured JSON logging
+tenacity>=9.0.0                     # retry with exponential backoff
+
+# ── LangChain ─────────────────────────────────────────────────────────────────
+langchain-core>=0.3.0               # BaseEmbeddings, Document base classes
+langchain-text-splitters>=0.3.0     # MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+langchain-openai>=0.3.0             # ChatOpenAI (loader enrichment) + OpenAIEmbeddings
+langchain-mongodb>=0.3.0            # MongoDBAtlasVectorSearch (handles Atlas query format)
+
+# ── File Connectors ───────────────────────────────────────────────────────────
+aiofiles>=24.1.0                    # async file reads — LocalConnector
+msgraph-sdk>=1.9.0                  # SharePoint via Microsoft Graph API (Phase 6)
+azure-identity>=1.19.0              # ClientSecretCredential for SharePoint auth (Phase 6)
+
+# ── Structured Data Connectors (Phase 6b) ─────────────────────────────────────
+sqlalchemy[asyncio]>=2.0.0          # async ORM + connection pooling for SQLConnector
+asyncpg>=0.30.0                     # PostgreSQL async driver (postgresql+asyncpg://)
+aiomysql>=0.2.0                     # MySQL async driver (mysql+aiomysql://)
+# pymongo already listed above — used by MongoDBConnector as well
+
+# ── Document Loaders ──────────────────────────────────────────────────────────
+pymupdf>=1.24.0                     # PDF: open + inspect pages (text chars, images)
+pymupdf4llm>=0.3.0                  # PDF: extract text → clean Markdown (no model downloads)
+markitdown[all]>=0.1.0              # DOCX / PPTX / XLSX → Markdown (Microsoft, offline)
+python-docx>=1.1.0                  # DOCX: inspect complexity (images, nested tables)
+# NOTE: docling removed — requires ~1.5GB HuggingFace model downloads at runtime,
+#       blocked by corporate firewall. Replaced by pymupdf4llm (text PDFs) +
+#       ChatOpenAI Vision via LangChain (scanned PDFs / embedded images).
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+orjson>=3.10.0                      # fast JSON — used in connector hash computation
