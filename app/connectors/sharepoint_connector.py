@@ -131,9 +131,11 @@ class SharePointConnector(BaseConnector):
         Deleted items yield DeltaItem(type="deleted", source_id=..., raw_doc=None).
         """
         start_url = (
-            self._saved_delta_token  # delta scan — use saved URL directly
+            self._ensure_select(
+                self._saved_delta_token
+            )  # delta scan — add $select if missing
             if self._saved_delta_token
-            else self._build_delta_url()  # full scan
+            else self._build_delta_url()  # full scan — $select already included
         )
 
         log.info(
@@ -220,9 +222,10 @@ class SharePointConnector(BaseConnector):
                 yield item
 
             if next_link := data.get("@odata.nextLink"):
-                url = next_link
+                # Ensure $select survives across pagination pages
+                url = self._ensure_select(next_link)
             elif delta_link := data.get("@odata.deltaLink"):
-                # Final page — save the deltaLink for next run
+                # Final page — save raw deltaLink (we apply _ensure_select on next run load)
                 self._new_delta_token = delta_link
                 log.info("sharepoint.delta_link_captured")
                 url = None
@@ -238,14 +241,43 @@ class SharePointConnector(BaseConnector):
 
     # ── Item processing ────────────────────────────────────────────────────────
 
+    # Fields that must always be selected — @microsoft.graph.downloadUrl
+    # is NOT returned by default and must be explicitly requested.
+    _SELECT = (
+        "id,name,size,file,folder,parentReference,"
+        "webUrl,lastModifiedDateTime,eTag,"
+        "@microsoft.graph.downloadUrl"
+    )
+
+    @classmethod
+    def _ensure_select(cls, url: str) -> str:
+        """
+        Append $select to any Graph delta/nextLink URL if not already present.
+        Needed because:
+          - Saved deltaLink tokens from previous runs don't carry $select
+          - @odata.nextLink pages also lose $select if not in original request
+        """
+        if "$select" not in url:
+            sep = "&" if "?" in url else "?"
+            return f"{url}{sep}$select={cls._SELECT}"
+        return url
+
     def _build_delta_url(self) -> str:
         base = (
             f"{GRAPH_BASE}/sites/{self._site_id}" f"/drives/{self._resolved_drive_id}"
         )
+        # $select must explicitly include @microsoft.graph.downloadUrl —
+        # Graph API does NOT return it by default. Without it every file
+        # gets skipped with "no_download_url".
+        select = (
+            "id,name,size,file,folder,parentReference,"
+            "webUrl,lastModifiedDateTime,eTag,"
+            "@microsoft.graph.downloadUrl"
+        )
         if self._root_folder:
             encoded = quote(self._root_folder, safe="/")
-            return f"{base}/root:/{encoded}:/delta"
-        return f"{base}/root/delta"
+            return f"{base}/root:/{encoded}:/delta?$select={select}"
+        return f"{base}/root/delta?$select={select}"
 
     async def _item_to_raw_document(self, item: dict) -> Optional[RawDocument]:
         """
