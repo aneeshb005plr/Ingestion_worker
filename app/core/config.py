@@ -29,6 +29,7 @@ class Settings(BaseSettings):
 
     # ── OpenAI ────────────────────────────────────────────────────────────────
     OPENAI_API_KEY: str
+    EMBEDDING_MODEL: str = "text-embedding-3-small"  # default, overridable per tenant
 
     # ── Computed: parsed from REDIS_URI, not set manually ─────────────────────
     @computed_field  # type: ignore[misc]

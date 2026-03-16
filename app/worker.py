@@ -19,6 +19,8 @@ The orchestrator enqueues jobs like this:
 The function name "process_ingestion_task" must match exactly.
 """
 
+from datetime import datetime, timezone
+
 import structlog
 from arq.connections import RedisSettings
 
@@ -178,15 +180,49 @@ async def process_ingestion_task(
         # ── Step 2: Build per-task services ───────────────────────────────────
         # VectorStore and IngestionService are per-task — they need the
         # index_name from repo config which varies per repo/tenant
+
+        # ── Provider selection from tenant ingestion_defaults ─────────────────
+        # Tenant config can override the global embedding provider/model.
+        # Currently OpenAI is the only provider — future: Azure OpenAI, Cohere etc.
+        # Falls back to the global startup provider if not specified.
+        ingestion_defaults = tenant_config.get("ingestion_defaults", {})
+        tenant_embedding_model = ingestion_defaults.get("embedding_model")
+        if (
+            tenant_embedding_model
+            and tenant_embedding_model != settings.EMBEDDING_MODEL
+        ):
+            try:
+                from app.providers.embedding.openai_provider import (
+                    OpenAIEmbeddingProvider,
+                )
+
+                task_embedding_provider = OpenAIEmbeddingProvider(
+                    api_key=settings.OPENAI_API_KEY,
+                    model=tenant_embedding_model,
+                )
+                bound_log.info(
+                    "task.embedding_provider_override",
+                    model=tenant_embedding_model,
+                )
+            except Exception as e:
+                bound_log.warning(
+                    "task.embedding_provider_override_failed",
+                    error=str(e),
+                    fallback=settings.EMBEDDING_MODEL,
+                )
+                task_embedding_provider = embedding_provider
+        else:
+            task_embedding_provider = embedding_provider  # use global default
+
         db = get_database()
         vector_store = MongoDBAtlasVectorStore(
             db=db,
             index_name=index_name,
-            lc_embeddings=embedding_provider.as_langchain_embeddings(),
+            lc_embeddings=task_embedding_provider.as_langchain_embeddings(),
         )
 
         ingestion_service = IngestionService(
-            embedding_provider=embedding_provider,  # shared — initialised once at startup
+            embedding_provider=task_embedding_provider,
             vector_store=vector_store,
             document_repo=document_repo,
             chunk_size=chunk_size,
@@ -202,16 +238,28 @@ async def process_ingestion_task(
         source_type = repo_config.get("source_type", "local")
         connector_config = repo_config.get("connector_config", {})
 
-        # Pass delta_token for SharePoint incremental scans.
-        # state.delta_token is set by save_delta_token() at end of each run.
-        # None on first run → full scan. Set on subsequent runs → delta scan.
-        delta_token = repo_config.get("state", {}).get("delta_token")
+        # Read state from repo config:
+        #   delta_token   → SharePoint incremental scan
+        #   last_run_at   → SQL/MongoDB delta fetch (WHERE updated_at > last_run_at)
+        repo_state = repo_config.get("state", {})
+        delta_token = repo_state.get("delta_token")
+
+        last_run_at_raw = repo_state.get("last_successful_run_at")
+        last_run_at = None
+        if last_run_at_raw:
+            if isinstance(last_run_at_raw, datetime):
+                last_run_at = (
+                    last_run_at_raw
+                    if last_run_at_raw.tzinfo
+                    else last_run_at_raw.replace(tzinfo=timezone.utc)
+                )
 
         connector = get_connector(
             source_type=source_type,
             connector_config=connector_config,
             credentials=credentials,
             delta_token=delta_token,
+            last_run_at=last_run_at,
         )
         await connector.connect()
 
@@ -298,11 +346,18 @@ async def process_ingestion_task(
                 stats.record_deletion(chunks_deleted=deleted_chunks)
                 bound_log.info("document.deleted", source_id=source_id)
 
-        # ── Step 6: Save delta token (SharePoint) ─────────────────────────────
-        # SharePoint returns a delta token after each sync — save it so the
-        # next run only fetches changes since this token.
+        # ── Step 6: Persist run state ─────────────────────────────────────────
+        # SharePoint: save deltaLink for incremental next scan
         if connector.delta_token:
             await repo_config_repo.save_delta_token(repo_id, connector.delta_token)
+
+        # SQL/MongoDB: save last_successful_run_at for delta fetch on next run
+        # (WHERE updated_at > last_run_at)
+        if source_type in ("sql", "mongodb"):
+            await repo_config_repo.update_last_ingested(
+                repo_id, datetime.now(timezone.utc)
+            )
+            bound_log.info("task.last_run_saved", source_type=source_type)
 
         await connector.disconnect()
 

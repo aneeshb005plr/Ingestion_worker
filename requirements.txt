@@ -38,7 +38,9 @@ aiomysql>=0.2.0                     # MySQL async driver (mysql+aiomysql://)
 pymupdf>=1.24.0                     # PDF: open + inspect pages (text chars, images)
 pymupdf4llm>=0.3.0                  # PDF: extract text → clean Markdown (no model downloads)
 markitdown[all]>=0.1.0              # DOCX / PPTX / XLSX → Markdown (Microsoft, offline)
-python-docx>=1.1.0                  # DOCX: inspect complexity (images, nested tables)
+python-docx>=1.1.0  
+python-pptx>=1.0.0  
+# DOCX: inspect complexity (images, nested tables)
 # NOTE: docling removed — requires ~1.5GB HuggingFace model downloads at runtime,
 #       blocked by corporate firewall. Replaced by pymupdf4llm (text PDFs) +
 #       ChatOpenAI Vision via LangChain (scanned PDFs / embedded images).

@@ -23,6 +23,7 @@ from app.loaders.base import BaseLoader
 from app.loaders.text_loader import TextLoader
 from app.loaders.pdf_loader import PDFLoader
 from app.loaders.docx_loader import DocxLoader
+from app.loaders.pptx_loader import PptxLoader
 from app.loaders.sql_loader import SQLLoader
 from app.loaders.mongodb_loader import MongoDBLoader
 from app.connectors.base import RawDocument
@@ -42,13 +43,14 @@ class LoaderFactory:
         """
         pdf = PDFLoader(llm=llm)
         docx = DocxLoader(llm=llm)
+        pptx = PptxLoader(llm=llm)
         text = TextLoader()
         sql = SQLLoader()
         mongodb = MongoDBLoader()
 
         # File registry: mime_type → loader
         self._file_registry: dict[str, BaseLoader] = {}
-        for loader in [pdf, docx, text]:
+        for loader in [pdf, docx, pptx, text]:
             for mime_type in loader.supported_mime_types():
                 self._file_registry[mime_type] = loader
 

@@ -87,7 +87,80 @@ class MetadataEnricher:
         self, raw_doc: RawDocument, schema: dict
     ) -> dict[str, Any]:
         """
-        Phase 7: extract tenant-defined custom fields from document properties.
-        Phase 1: returns empty dict — not yet implemented.
+        Extract tenant-defined custom metadata fields from document properties.
+
+        Schema format (matches MetadataSchema in orchestrator schemas/tenant.py):
+          {
+            "custom_fields": [
+              {
+                "field_name": "department",
+                "source": "path_segment",   # extract from full_path
+                "path_segment_index": 1,    # e.g. /finance/Q3.pdf → "finance"
+                "default": "unknown"
+              },
+              {
+                "field_name": "doc_type",
+                "source": "file_name",      # extract from file_name prefix/suffix
+                "default": "document"
+              },
+              {
+                "field_name": "region",
+                "source": "static",         # same value for all docs in this tenant
+                "default": "APAC"
+              }
+            ]
+          }
         """
-        return {}
+        custom: dict[str, Any] = {}
+        custom_fields = schema.get("custom_fields", [])
+
+        for field_def in custom_fields:
+            field_name = field_def.get("field_name")
+            source = field_def.get("source")
+            default = field_def.get("default", "unknown")
+
+            if not field_name or not source:
+                continue
+
+            try:
+                if source == "path_segment":
+                    # Extract a segment from the full_path by index
+                    # e.g. full_path="/finance/reports/Q3.pdf", index=1 → "reports"
+                    index = field_def.get("path_segment_index", 0)
+                    segments = [s for s in raw_doc.full_path.split("/") if s]
+                    # Exclude filename (last segment)
+                    path_parts = segments[:-1] if len(segments) > 1 else segments
+                    value = path_parts[index] if index < len(path_parts) else default
+
+                elif source == "file_name":
+                    # Use the file stem (name without extension)
+                    value = (
+                        raw_doc.file_name.rsplit(".", 1)[0]
+                        if "." in raw_doc.file_name
+                        else raw_doc.file_name
+                    )
+
+                elif source == "static":
+                    # Same value for every document under this tenant
+                    value = default
+
+                else:
+                    log.warning(
+                        "metadata.unknown_source",
+                        field=field_name,
+                        source=source,
+                    )
+                    value = default
+
+                custom[field_name] = value
+
+            except Exception as e:
+                log.warning(
+                    "metadata.custom_field_failed",
+                    field=field_name,
+                    source=source,
+                    error=str(e),
+                )
+                custom[field_name] = default
+
+        return custom

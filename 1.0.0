@@ -1,0 +1,5 @@
+Requirement already satisfied: python-pptx in d:\2026\vector solution\ingestion-worker\venv\lib\site-packages (1.0.2)
+Requirement already satisfied: Pillow>=3.3.2 in d:\2026\vector solution\ingestion-worker\venv\lib\site-packages (from python-pptx) (12.1.1)
+Requirement already satisfied: XlsxWriter>=0.5.7 in d:\2026\vector solution\ingestion-worker\venv\lib\site-packages (from python-pptx) (3.2.9)
+Requirement already satisfied: lxml>=3.1.0 in d:\2026\vector solution\ingestion-worker\venv\lib\site-packages (from python-pptx) (6.0.2)
+Requirement already satisfied: typing-extensions>=4.9.0 in d:\2026\vector solution\ingestion-worker\venv\lib\site-packages (from python-pptx) (4.15.0)

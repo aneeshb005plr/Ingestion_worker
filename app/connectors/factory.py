@@ -31,6 +31,7 @@ def get_connector(
     connector_config: dict,
     credentials: dict,
     delta_token: str | None = None,
+    last_run_at=None,
 ) -> BaseConnector:
     """
     Instantiate the correct connector for a given source type.
@@ -43,6 +44,8 @@ def get_connector(
                           (passwords, API keys, connection strings etc)
         delta_token:      SharePoint delta sync token from previous run (optional)
                           Only used by SharePointConnector — others ignore it.
+        last_run_at:      datetime of last successful run (optional)
+                          Injected into SQL and MongoDB connectors for delta fetch.
 
     Raises ValueError for unknown source types.
     """
@@ -61,4 +64,11 @@ def get_connector(
             credentials=credentials,
             delta_token=delta_token,
         )
-    return connector_class(config=connector_config, credentials=credentials)
+    connector = connector_class(config=connector_config, credentials=credentials)
+
+    # SQL and MongoDB need last_run_at for delta fetch (WHERE updated_at > last_run_at)
+    # Injected after construction — connector reads it in fetch_documents()
+    if last_run_at is not None and hasattr(connector, "last_run_at"):
+        connector.last_run_at = last_run_at
+
+    return connector
