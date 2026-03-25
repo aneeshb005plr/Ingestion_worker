@@ -103,7 +103,6 @@ class PptxLoader(BaseLoader):
         Images → [Image N] placeholder (replaced by Vision in async step).
         """
         from pptx import Presentation
-        from pptx.util import Pt
         from pptx.enum.shapes import MSO_SHAPE_TYPE
 
         prs = Presentation(BytesIO(raw_doc.content))

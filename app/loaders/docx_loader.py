@@ -51,6 +51,8 @@ class DocxLoader(BaseLoader):
     def supported_mime_types(self) -> list[str]:
         return [
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/msword",  # Old .doc format — SharePoint sometimes reports this
+            # even for .docx files. Handled via mammoth fallback.
         ]
 
     async def load(self, raw_doc: RawDocument) -> ParsedDocument:
@@ -63,7 +65,12 @@ class DocxLoader(BaseLoader):
             **complexity,
         )
 
-        # ── Stage 2: Parse with MarkItDown ────────────────────────────────────
+        # ── Stage 2: Parse with MarkItDown (with mammoth fallback) ──────────
+        # MarkItDown works for true .docx files.
+        # Old .doc files (binary Word 97-2003) disguised with .docx extension
+        # cause MarkItDown to fail with UnsupportedFormatException because
+        # SharePoint reports MIME type as application/msword.
+        # Fallback: mammoth handles both formats directly.
         def _convert_sync() -> str:
             stream = BytesIO(raw_doc.content)
             result = self._converter.convert_stream(
@@ -72,16 +79,42 @@ class DocxLoader(BaseLoader):
             )
             return result.text_content or ""
 
+        def _mammoth_fallback_sync() -> str:
+            """
+            Fallback using mammoth directly — handles old .doc format
+            and any .docx that MarkItDown rejects.
+            mammoth → HTML → strip tags for plain Markdown-ish text.
+            """
+            import mammoth
+
+            stream = BytesIO(raw_doc.content)
+            result = mammoth.convert_to_markdown(stream)
+            return result.value or ""
+
         try:
             markdown_text = await asyncio.to_thread(_convert_sync)
-        except Exception as e:
-            raise DocumentParsingError(
-                f"MarkItDown failed to parse '{raw_doc.file_name}': {e}"
-            ) from e
+        except Exception as markitdown_err:
+            log.warning(
+                "loader.docx.markitdown_failed_trying_mammoth",
+                file=raw_doc.file_name,
+                error=str(markitdown_err),
+            )
+            try:
+                markdown_text = await asyncio.to_thread(_mammoth_fallback_sync)
+                log.info(
+                    "loader.docx.mammoth_fallback_succeeded",
+                    file=raw_doc.file_name,
+                )
+            except Exception as mammoth_err:
+                raise DocumentParsingError(
+                    f"Failed to parse '{raw_doc.file_name}': "
+                    f"MarkItDown: {markitdown_err} | mammoth: {mammoth_err}"
+                ) from mammoth_err
 
         if not markdown_text.strip():
             raise DocumentParsingError(
-                f"MarkItDown returned empty content for '{raw_doc.file_name}'"
+                f"No content extracted from '{raw_doc.file_name}' — "
+                "document may be encrypted, empty, or in an unsupported format."
             )
 
         # ── Stage 3: LLM enrichment — only if needed ─────────────────────────

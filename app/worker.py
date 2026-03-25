@@ -19,12 +19,14 @@ The orchestrator enqueues jobs like this:
 The function name "process_ingestion_task" must match exactly.
 """
 
+import asyncio
 from datetime import datetime, timezone
 
 import structlog
 from arq.connections import RedisSettings
 
 from app.core.config import settings
+from app.core.api_config import resolve_api_config
 from app.core.logging import setup_logging
 from app.core.exceptions import RepoConfigNotFoundError, ConnectorError
 from app.db.mongo import connect_to_mongo, close_mongo_connection, get_database
@@ -37,6 +39,7 @@ from app.providers.embedding.openai_provider import OpenAIEmbeddingProvider
 from app.providers.vectorstore.mongodb_atlas import MongoDBAtlasVectorStore
 from app.services.ingestion_service import IngestionService
 from app.services.job_lifecycle import JobLifecycleService
+from app.notifications.notification_service import NotificationService
 
 # Configure logging immediately — before any other imports log anything
 setup_logging()
@@ -68,37 +71,23 @@ async def startup(ctx: dict) -> None:
     ctx["document_repo"] = DocumentRepository(db)
     ctx["repo_config_repo"] = RepoConfigRepository(db)
 
-    # 3. Embedding provider — one OpenAI client for the whole worker process
+    # 3. Embedding provider — one OpenAI client for the whole worker process.
+    # batch_size and concurrency use defaults here — overridden per-task
+    # if tenant config specifies different values.
     ctx["embedding_provider"] = OpenAIEmbeddingProvider(
         api_key=settings.OPENAI_API_KEY,
-        model="text-embedding-3-small",
+        model=settings.EMBEDDING_MODEL,
+        batch_size=512,
     )
 
-    # 4. LLM for loader enrichment — used only when document complexity requires it:
-    #    - Scanned PDFs (no text layer) → Vision OCR per page
-    #    - Embedded images in PDF/DOCX  → Vision descriptions
-    #    - Nested tables in DOCX        → LLM cleanup
-    #    api_key is read automatically from OPENAI_API_KEY env var.
-    #    If init fails, worker continues in library-only mode (graceful degradation).
-    try:
-        from langchain_openai import ChatOpenAI
-
-        ctx["loader_llm"] = ChatOpenAI(
-            model="gpt-4o",
-            temperature=0,
-            max_tokens=4096,
-        )
-        log.info("loader.llm.initialised", model="gpt-4o")
-    except Exception as e:
-        log.warning(
-            "loader.llm.init_failed",
-            error=str(e),
-            message="LLM enrichment disabled — scanned PDFs and images won't be described",
-        )
-        ctx["loader_llm"] = None
+    # 4. LLM for loader enrichment (Vision OCR, image descriptions, nested table cleanup)
+    # Built per-task from tenant api_config — different tenants may use different
+    # models (gpt-4o, gpt-4.1-mini etc.) and different API keys/endpoints.
+    # ctx["loader_llm"] intentionally not set here — resolved per task below.
 
     # 5. Job lifecycle service
     ctx["job_lifecycle"] = JobLifecycleService(ctx["job_repo"])
+    ctx["notification_service"] = NotificationService()
 
     log.info("worker.ready")
 
@@ -120,6 +109,7 @@ async def process_ingestion_task(
     job_id: str,
     repo_id: str,
     tenant_id: str,
+    trigger: str = "manual",
 ) -> dict:
     """
     The main ingestion task. Called by ARQ for every job dequeued from Redis.
@@ -133,12 +123,14 @@ async def process_ingestion_task(
       6. Detect implicit deletes (connectors without native delete support)
       7. Save delta token if connector supports it
       8. Mark job completed with final stats
+      9. Send notifications (email/webhook) if configured
 
     Args:
       ctx       : ARQ worker context (shared across all tasks in this process)
       job_id    : UUID of the job record in MongoDB
       repo_id   : ID of the source_repository to ingest
       tenant_id : ID of the tenant that owns this repo
+      trigger   : "manual" | "scheduled" — passed from job_service at enqueue time
 
     Returns:
       dict with final job stats (also written to MongoDB)
@@ -172,47 +164,102 @@ async def process_ingestion_task(
         chunk_overlap = repo_overrides.get("chunk_overlap") or tenant_defaults.get(
             "chunk_overlap", 150
         )
+        document_concurrency = repo_overrides.get(
+            "document_concurrency"
+        ) or tenant_defaults.get("document_concurrency", 10)
+        embedding_batch_size = tenant_defaults.get("embedding_batch_size", 512)
+        embedding_concurrency = tenant_defaults.get("embedding_concurrency", 5)
+
+        # Contextual enrichment config
+        # repo override takes precedence over tenant default
+        tenant_enrichment_enabled = tenant_defaults.get(
+            "contextual_enrichment_enabled", False
+        )
+        repo_enrichment_override = repo_overrides.get(
+            "contextual_enrichment_enabled", None
+        )
+        contextual_enrichment_enabled = (
+            repo_enrichment_override
+            if repo_enrichment_override is not None
+            else tenant_enrichment_enabled
+        )
+        contextual_enrichment_mode = tenant_defaults.get(
+            "contextual_enrichment_mode", "all_chunks"
+        )
+        contextual_enrichment_concurrency = tenant_defaults.get(
+            "contextual_enrichment_concurrency", 3
+        )
 
         # Resolve vector index name for this repo
         vector_config = repo_config.get("vector_config", {})
-        index_name = vector_config.get("index_name", f"vidx_tenant_{tenant_id}")
+        index_name = vector_config.get("index_name", f"vidx_repo_{repo_id}")
 
         # ── Step 2: Build per-task services ───────────────────────────────────
         # VectorStore and IngestionService are per-task — they need the
         # index_name from repo config which varies per repo/tenant
 
-        # ── Provider selection from tenant ingestion_defaults ─────────────────
-        # Tenant config can override the global embedding provider/model.
-        # Currently OpenAI is the only provider — future: Azure OpenAI, Cohere etc.
-        # Falls back to the global startup provider if not specified.
-        ingestion_defaults = tenant_config.get("ingestion_defaults", {})
-        tenant_embedding_model = ingestion_defaults.get("embedding_model")
-        if (
-            tenant_embedding_model
-            and tenant_embedding_model != settings.EMBEDDING_MODEL
-        ):
-            try:
-                from app.providers.embedding.openai_provider import (
-                    OpenAIEmbeddingProvider,
-                )
+        # ── Resolve per-tenant API config ─────────────────────────────────────
+        # embedding_model  → from ingestion_defaults (HOW to ingest)
+        # api_key/base_url → from api_config (WHERE/WHO — credentials + endpoint)
+        # llm_model        → from api_config (used by retrieval service)
+        tenant_api_cfg = await resolve_api_config(
+            tenant_api_config=tenant_config.get("api_config"),
+            tenant_ingestion_defaults=tenant_defaults,
+        )
 
+        if tenant_api_cfg.needs_custom_provider:
+            try:
                 task_embedding_provider = OpenAIEmbeddingProvider(
-                    api_key=settings.OPENAI_API_KEY,
-                    model=tenant_embedding_model,
+                    api_key=tenant_api_cfg.api_key,
+                    model=tenant_api_cfg.embedding_model,
+                    batch_size=embedding_batch_size,
+                    base_url=tenant_api_cfg.base_url,
                 )
                 bound_log.info(
-                    "task.embedding_provider_override",
-                    model=tenant_embedding_model,
+                    "task.embedding_provider_resolved",
+                    model=tenant_api_cfg.embedding_model,
+                    tenant_key=tenant_api_cfg.is_tenant_key,
+                    custom_base_url=tenant_api_cfg.base_url is not None,
                 )
             except Exception as e:
                 bound_log.warning(
-                    "task.embedding_provider_override_failed",
+                    "task.embedding_provider_fallback",
                     error=str(e),
                     fallback=settings.EMBEDDING_MODEL,
                 )
                 task_embedding_provider = embedding_provider
         else:
-            task_embedding_provider = embedding_provider  # use global default
+            task_embedding_provider = embedding_provider  # reuse global default
+
+        # ── Per-tenant LLM for Vision / loader enrichment ─────────────────────
+        # Uses tenant llm_model + api_key + base_url from api_config.
+        # Same model used for: scanned PDF OCR, image descriptions, table cleanup.
+        # Built per-task so each tenant uses their own key and model.
+        # Graceful degradation: if init fails, loaders run in library-only mode.
+        try:
+            from langchain_openai import ChatOpenAI
+
+            lc_kwargs = dict(
+                model=tenant_api_cfg.llm_model,
+                temperature=0,
+                max_tokens=4096,
+                api_key=tenant_api_cfg.api_key,
+            )
+            if tenant_api_cfg.base_url:
+                lc_kwargs["base_url"] = tenant_api_cfg.base_url
+            task_loader_llm = ChatOpenAI(**lc_kwargs)
+            bound_log.info(
+                "task.loader_llm_resolved",
+                model=tenant_api_cfg.llm_model,
+                tenant_key=tenant_api_cfg.is_tenant_key,
+            )
+        except Exception as e:
+            bound_log.warning(
+                "task.loader_llm_failed",
+                error=str(e),
+                message="Vision/LLM enrichment disabled for this task",
+            )
+            task_loader_llm = None
 
         db = get_database()
         vector_store = MongoDBAtlasVectorStore(
@@ -227,12 +274,14 @@ async def process_ingestion_task(
             document_repo=document_repo,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
-            loader_llm=ctx.get(
-                "loader_llm"
-            ),  # None if init failed — graceful degradation
+            loader_llm=task_loader_llm,
+            contextual_enrichment_enabled=contextual_enrichment_enabled,
+            contextual_enrichment_mode=contextual_enrichment_mode,
+            contextual_enrichment_concurrency=contextual_enrichment_concurrency,
         )
 
         tenant_metadata_schema = tenant_config.get("metadata_schema")
+        repo_metadata_overrides = repo_overrides.get("metadata_overrides")
 
         # ── Step 3: Connect to data source ────────────────────────────────────
         source_type = repo_config.get("source_type", "local")
@@ -254,7 +303,7 @@ async def process_ingestion_task(
                     else last_run_at_raw.replace(tzinfo=timezone.utc)
                 )
 
-        connector = get_connector(
+        connector = await get_connector(
             source_type=source_type,
             connector_config=connector_config,
             credentials=credentials,
@@ -263,71 +312,94 @@ async def process_ingestion_task(
         )
         await connector.connect()
 
-        # ── Step 4: Stream and process documents ──────────────────────────────
-        # Track source_ids seen in this run — used in Step 5 for deletion detection
+        # ── Step 4: Stream and process documents (concurrent) ────────────────
+        # Semaphore limits how many documents process simultaneously.
+        # Deleted items are handled inline (synchronously) — no concurrency needed.
+        # Upsert items are dispatched to a TaskGroup, bounded by the semaphore.
         seen_source_ids: set[str] = set()
 
-        bound_log.info("task.fetching_documents")
+        # stats.record_document_result and stats.record_deletion must be
+        # thread-safe. JobLifecycleStats uses simple counters — asyncio is
+        # single-threaded so concurrent coroutines are safe without locks.
+        # doc_semaphore  — max documents processing simultaneously
+        # embed_semaphore — max concurrent OpenAI embedding calls across ALL
+        #                   documents. Shared here so all 10 concurrent docs
+        #                   compete for the same embedding budget, preventing
+        #                   rate limit floods.
+        doc_semaphore = asyncio.Semaphore(document_concurrency)
+        embed_semaphore = asyncio.Semaphore(embedding_concurrency)
 
-        async for delta_item in connector.fetch_documents():
+        bound_log.info(
+            "task.fetching_documents",
+            document_concurrency=document_concurrency,
+            embedding_concurrency=embedding_concurrency,
+            embedding_batch_size=embedding_batch_size,
+        )
 
-            if delta_item.type == "deleted":
-                # Connector explicitly reported this item as deleted
-                # (only connectors with supports_native_deletes=True yield these,
-                #  e.g. SharePoint delta API)
-                #
-                # Route through deduplicator first — only delete from vectors
-                # if the document was actually ingested. Guards against SP reporting
-                # deletions for files we never processed (unsupported type, filtered out).
-                dedup_result = await ingestion_service._deduplicator.mark_deleted(
+        async def process_upsert(raw_doc) -> None:
+            """
+            Process one upserted document under the doc semaphore.
+            Embedding step acquires the shared embed_semaphore so total
+            concurrent OpenAI calls stay within embedding_concurrency
+            regardless of how many docs are processing simultaneously.
+            """
+            async with doc_semaphore:
+                result = await ingestion_service.process_document(
+                    raw_doc=raw_doc,
                     tenant_id=tenant_id,
                     repo_id=repo_id,
-                    source_id=delta_item.source_id,
-                )
-                if dedup_result.existing_doc:
-                    deleted_chunks = await vector_store.delete_by_source(
-                        source_id=delta_item.source_id,
-                        tenant_id=tenant_id,
-                        repo_id=repo_id,
-                    )
-                    await document_repo.mark_deleted(
-                        tenant_id=tenant_id,
-                        repo_id=repo_id,
-                        source_id=delta_item.source_id,
-                    )
-                    stats.record_deletion(chunks_deleted=deleted_chunks)
-                    bound_log.info("document.deleted", source_id=delta_item.source_id)
-                continue
-
-            # type == "upsert" — new or potentially changed document
-            seen_source_ids.add(delta_item.source_id)
-            raw_doc = delta_item.raw_doc
-
-            result = await ingestion_service.process_document(
-                raw_doc=raw_doc,
-                tenant_id=tenant_id,
-                repo_id=repo_id,
-                job_id=job_id,
-                tenant_metadata_schema=tenant_metadata_schema,
-            )
-            stats.record_document_result(result)
-
-            if result.get("status") == "failed":
-                await ctx["job_repo"].append_document_error(
                     job_id=job_id,
-                    file_name=raw_doc.file_name,
-                    error=result.get("error", "Unknown error"),
+                    tenant_metadata_schema=tenant_metadata_schema,
+                    repo_metadata_overrides=repo_metadata_overrides,
+                    embed_semaphore=embed_semaphore,
                 )
+                stats.record_document_result(result)
+                if result.get("status") == "failed":
+                    await ctx["job_repo"].append_document_error(
+                        job_id=job_id,
+                        file_name=raw_doc.file_name,
+                        error=result.get("error", "Unknown error"),
+                    )
+
+        async with asyncio.TaskGroup() as tg:
+            async for delta_item in connector.fetch_documents():
+
+                if delta_item.type == "deleted":
+                    # Deleted items handled synchronously — no concurrency needed.
+                    # Route through deduplicator: only delete if we actually ingested it.
+                    dedup_result = await ingestion_service.deduplicator.mark_deleted(
+                        tenant_id=tenant_id,
+                        repo_id=repo_id,
+                        source_id=delta_item.source_id,
+                    )
+                    if dedup_result.existing_doc:
+                        deleted_chunks = await vector_store.delete_by_source(
+                            source_id=delta_item.source_id,
+                            tenant_id=tenant_id,
+                            repo_id=repo_id,
+                        )
+                        await document_repo.mark_deleted(
+                            tenant_id=tenant_id,
+                            repo_id=repo_id,
+                            source_id=delta_item.source_id,
+                        )
+                        stats.record_deletion(chunks_deleted=deleted_chunks)
+                        bound_log.info(
+                            "document.deleted", source_id=delta_item.source_id
+                        )
+                    continue
+
+                # Upsert — dispatch to TaskGroup (bounded by semaphore)
+                seen_source_ids.add(delta_item.source_id)
+                tg.create_task(process_upsert(delta_item.raw_doc))
+
+        # TaskGroup awaits all tasks before exiting — all documents processed here
 
         # ── Step 5: Detect implicit deletes ───────────────────────────────────
-        # Connectors with supports_native_deletes=True (SharePoint) already yielded
-        # explicit DeltaItem(type="deleted") in Step 4 — nothing more to do.
-        #
-        # Connectors without native delete support (local, SQL, MongoDB) need us
-        # to compare what we saw this run vs what's in the registry.
-        # Anything in the registry but NOT seen → deleted.
+        # SharePoint yields explicit deleted items in Step 4 — nothing more to do.
+        # Local, SQL, MongoDB compare seen_source_ids vs registry.
         if not connector.supports_native_deletes:
-            deleted_ids = await ingestion_service._deduplicator.check_for_deletions(
+            deleted_ids = await ingestion_service.deduplicator.check_for_deletions(
                 tenant_id=tenant_id,
                 repo_id=repo_id,
                 seen_source_ids=seen_source_ids,
@@ -364,18 +436,62 @@ async def process_ingestion_task(
         # ── Step 7: Mark job completed ────────────────────────────────────────
         await job_lifecycle.complete(job_id, stats)
         bound_log.info("task.completed", **stats.to_dict())
+
+        # ── Step 8: Send notifications ────────────────────────────────────
+        notification_config = repo_config.get("notification_config", {})
+        notification_service: NotificationService = ctx["notification_service"]
+        status = "partial" if stats.has_failures else "completed"
+        await notification_service.notify(
+            notification_config=notification_config,
+            job_id=job_id,
+            tenant_id=tenant_id,
+            repo_id=repo_id,
+            repo_name=repo_config.get("name", repo_id),
+            trigger=trigger,
+            status=status,
+            stats=stats,
+        )
         return stats.to_dict()
 
     except (RepoConfigNotFoundError, ConnectorError) as e:
         # Job-level failure — can't continue at all
         bound_log.error("task.failed", error=str(e))
         await job_lifecycle.fail(job_id, str(e))
+        # Notify on failure
+        notification_config = (
+            repo_config.get("notification_config", {}) if repo_config else {}
+        )
+        await ctx["notification_service"].notify(
+            notification_config=notification_config,
+            job_id=job_id,
+            tenant_id=tenant_id,
+            repo_id=repo_id,
+            repo_name=repo_config.get("name", repo_id) if repo_config else repo_id,
+            trigger=trigger,
+            status="failed",
+            stats=stats,
+            error=str(e),
+        )
         raise  # re-raise so ARQ marks the task as failed
 
     except Exception as e:
         # Unexpected job-level failure
         bound_log.error("task.failed_unexpected", error=str(e))
         await job_lifecycle.fail(job_id, str(e))
+        notification_config = (
+            repo_config.get("notification_config", {}) if repo_config else {}
+        )
+        await ctx["notification_service"].notify(
+            notification_config=notification_config,
+            job_id=job_id,
+            tenant_id=tenant_id,
+            repo_id=repo_id,
+            repo_name=repo_config.get("name", repo_id) if repo_config else repo_id,
+            trigger=trigger,
+            status="failed",
+            stats=stats,
+            error=str(e),
+        )
         raise
 
 
@@ -393,6 +509,8 @@ class WorkerSettings:
     on_shutdown = shutdown
 
     redis_settings = RedisSettings.from_dsn(str(settings.REDIS_URI))
+    if settings.REDIS_PASSWORD:
+        redis_settings.password = settings.REDIS_PASSWORD
     queue_name = settings.QUEUE_NAME
 
     # How many tasks this worker runs concurrently

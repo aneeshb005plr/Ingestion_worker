@@ -2,7 +2,7 @@
 ConnectorFactory — maps source_type strings to connector classes.
 
 Adding a new connector (e.g. S3):
-  1. Create app/connectors/s3_connector.py with class S3Connector(BaseConnector)
+  1. Create app/connectors/s3.py with class S3Connector(BaseConnector)
   2. Add "s3": S3Connector to the registry below
   3. That's it — zero other changes needed
 """
@@ -11,9 +11,10 @@ import structlog
 
 from app.connectors.base import BaseConnector
 from app.connectors.local_connector import LocalConnector
-from app.connectors.sharepoint_connector import SharePointConnector
+from app.connectors.sharepoint import SharePointConnector
 from app.connectors.mongodb_connector import MongoDBConnector
 from app.connectors.sql_connector import SQLConnector
+from app.core.encryption import decrypt_credentials
 
 log = structlog.get_logger(__name__)
 
@@ -26,7 +27,7 @@ _REGISTRY: dict[str, type[BaseConnector]] = {
 }
 
 
-def get_connector(
+async def get_connector(
     source_type: str,
     connector_config: dict,
     credentials: dict,
@@ -36,16 +37,17 @@ def get_connector(
     """
     Instantiate the correct connector for a given source type.
 
+    Async because sensitive credential fields (client_secret,
+    connection_string etc.) are decrypted here before the connector
+    is built — decryption may involve a Key Vault network call in prod.
+
     Args:
         source_type:      e.g. "local", "sharepoint", "mongodb", "sql"
         connector_config: repo's connector_config from MongoDB
                           (paths, filters, table names etc — NOT secrets)
-        credentials:      decrypted credentials from MongoDB
-                          (passwords, API keys, connection strings etc)
+        credentials:      encrypted credentials from MongoDB — decrypted here
         delta_token:      SharePoint delta sync token from previous run (optional)
-                          Only used by SharePointConnector — others ignore it.
         last_run_at:      datetime of last successful run (optional)
-                          Injected into SQL and MongoDB connectors for delta fetch.
 
     Raises ValueError for unknown source types.
     """
@@ -55,19 +57,27 @@ def get_connector(
         raise ValueError(
             f"Unknown source_type '{source_type}'. " f"Supported types: {supported}"
         )
+
+    # Decrypt sensitive credential fields before passing to connector
+    # e.g. sharepoint: client_secret, sql: connection_string
+    decrypted_creds = await decrypt_credentials(source_type, credentials)
+
     log.info("connector.selected", source_type=source_type)
 
     # SharePoint needs delta_token for incremental scans
     if source_type.lower() == "sharepoint":
         return connector_class(
             config=connector_config,
-            credentials=credentials,
+            credentials=decrypted_creds,
             delta_token=delta_token,
         )
-    connector = connector_class(config=connector_config, credentials=credentials)
+
+    connector = connector_class(
+        config=connector_config,
+        credentials=decrypted_creds,
+    )
 
     # SQL and MongoDB need last_run_at for delta fetch (WHERE updated_at > last_run_at)
-    # Injected after construction — connector reads it in fetch_documents()
     if last_run_at is not None and hasattr(connector, "last_run_at"):
         connector.last_run_at = last_run_at
 

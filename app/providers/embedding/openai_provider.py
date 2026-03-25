@@ -1,19 +1,16 @@
 """
 OpenAI Embedding Provider — uses LangChain's OpenAIEmbeddings internally.
 
-Why LangChain here:
-  - langchain-openai's OpenAIEmbeddings handles batching, retries, and async
-    correctly out of the box and is actively maintained
-  - It implements the LangChain Embeddings interface which MongoDBAtlasVectorSearch
-    expects — no adapter needed
-  - Our BaseEmbeddingProvider ABC wraps it, so the rest of the system
-    never imports LangChain directly — we keep our abstraction layer intact
+Responsibilities:
+  - Split texts into batches of batch_size
+  - Call OpenAI sequentially per batch (simple, predictable)
+  - Return embeddings in original order
 
-What our wrapper adds on top:
-  - Exposes our own BaseEmbeddingProvider interface (dimensions, model_name)
-  - Provides the LangChain Embeddings object via .as_langchain_embeddings()
-    so MongoDBAtlasVectorStore can use it directly
-  - Single place to configure the model for the whole system
+Concurrency is NOT managed here.
+The worker holds a shared asyncio.Semaphore(embedding_concurrency) that
+controls how many embed_documents() calls are in-flight across all
+concurrent documents. This is the right place to enforce rate limits —
+not inside the provider where it can't see the full picture.
 """
 
 import structlog
@@ -26,20 +23,36 @@ log = structlog.get_logger(__name__)
 
 class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
 
-    def __init__(self, api_key: str, model: str = "text-embedding-3-small") -> None:
-        # LangChain's OpenAIEmbeddings — handles batching + async internally
-        self._lc_embeddings = OpenAIEmbeddings(
-            openai_api_key=api_key,
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "text-embedding-3-small",
+        batch_size: int = 512,
+        base_url: str | None = None,
+    ) -> None:
+        """
+        Args:
+            api_key:    OpenAI API key
+            model:      Embedding model name
+            batch_size: Texts per API call (default 512)
+            base_url:   Azure OpenAI base URL (None = use OpenAI default)
+        """
+        kwargs = dict(
+            api_key=api_key,
             model=model,
-            # chunk_size controls how many texts per API request
-            # 512 is safe for text-embedding-3-small
-            chunk_size=512,
+            chunk_size=batch_size,
         )
+        if base_url:
+            kwargs["base_url"] = base_url
+        self._lc_embeddings = OpenAIEmbeddings(**kwargs)
         self._model = model
-        # text-embedding-3-small → 1536 dims, text-embedding-3-large → 3072 dims
+        self._batch_size = batch_size
         self._dimensions = 1536 if "small" in model else 3072
         log.info(
-            "embedding.provider.initialised", model=model, dimensions=self._dimensions
+            "embedding.provider.initialised",
+            model=model,
+            dimensions=self._dimensions,
+            batch_size=batch_size,
         )
 
     @property
@@ -52,14 +65,25 @@ class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
         """
-        Embed a list of texts using LangChain's OpenAIEmbeddings.
-        LangChain handles batching and rate limit retries internally.
+        Embed texts in batches, sequentially.
+
+        Concurrency across multiple documents is controlled by the caller
+        (worker's shared embedding_semaphore) — not here.
+        LangChain handles retries and rate limit backoff internally.
         """
         if not texts:
             return []
-        log.info("embedding.started", total_texts=len(texts), model=self._model)
+
+        log.debug(
+            "embedding.started",
+            total_texts=len(texts),
+            batch_size=self._batch_size,
+            model=self._model,
+        )
+
         embeddings = await self._lc_embeddings.aembed_documents(texts)
-        log.info("embedding.completed", total_texts=len(texts))
+
+        log.debug("embedding.completed", total_texts=len(texts))
         return embeddings
 
     def as_langchain_embeddings(self) -> OpenAIEmbeddings:
@@ -67,8 +91,5 @@ class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
         Returns the underlying LangChain Embeddings object.
         Used by MongoDBAtlasVectorStore which requires a LangChain
         Embeddings instance for its constructor.
-
-        This is the bridge between our abstraction and LangChain's internals.
-        Nothing else should call this method.
         """
         return self._lc_embeddings

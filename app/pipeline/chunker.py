@@ -55,9 +55,34 @@ class Chunker:
         # Stage 2: apply size limit → handles oversized sections
         final_chunks = self._recursive_splitter.split_documents(header_chunks)
 
+        # Stage 3: prepend section breadcrumb to each chunk text
+        # This ensures sub-chunks that lost their header during splitting
+        # still embed with section context.
+        # e.g. "## 3.2 Primary Contacts\nBrad Jorgenson..." scores higher
+        # for "give me contacts" than just "Brad Jorgenson..." alone.
+        for chunk in final_chunks:
+            breadcrumb = self._build_breadcrumb(chunk.metadata)
+            if breadcrumb and not chunk.page_content.startswith(breadcrumb):
+                chunk.page_content = f"{breadcrumb}\n{chunk.page_content}"
+
         log.info(
             "chunker.split",
             header_chunks=len(header_chunks),
             final_chunks=len(final_chunks),
         )
         return final_chunks
+
+    def _build_breadcrumb(self, metadata: dict) -> str:
+        """
+        Build a section breadcrumb from chunk metadata headers.
+        e.g. metadata {h1: "Contacts", h2: "Primary"} → "# Contacts\n## Primary"
+        Only uses the deepest two levels to avoid noise.
+        """
+        parts = []
+        if metadata.get("h1"):
+            parts.append(f"# {metadata['h1']}")
+        if metadata.get("h2"):
+            parts.append(f"## {metadata['h2']}")
+        if metadata.get("h3"):
+            parts.append(f"### {metadata['h3']}")
+        return "\n".join(parts)

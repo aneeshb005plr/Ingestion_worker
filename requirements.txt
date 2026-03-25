@@ -1,6 +1,6 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 # ingestion-worker — Python 3.13
-# Last updated: Feb 25 2026
+# Last updated: Mar 17 2026
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Queue & Task Runner ───────────────────────────────────────────────────────
@@ -11,39 +11,47 @@ pydantic>=2.9.0
 pydantic-settings>=2.6.0            # reads .env into Settings class
 
 # ── Database ──────────────────────────────────────────────────────────────────
-pymongo>=4.10.0                     # AsyncMongoClient (native async, tz_aware support)
+pymongo>=4.10.0                     # AsyncMongoClient — langchain-mongodb needs >=4.6.1, using 4.10+ for async
 
 # ── Logging & Resilience ──────────────────────────────────────────────────────
 structlog>=24.4.0                   # structured JSON logging
 tenacity>=9.0.0                     # retry with exponential backoff
 
 # ── LangChain ─────────────────────────────────────────────────────────────────
-langchain-core>=0.3.0               # BaseEmbeddings, Document base classes
-langchain-text-splitters>=0.3.0     # MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
-langchain-openai>=0.3.0             # ChatOpenAI (loader enrichment) + OpenAIEmbeddings
-langchain-mongodb>=0.3.0            # MongoDBAtlasVectorSearch (handles Atlas query format)
+langchain-core>=1.2.5               # BaseEmbeddings, Document base classes
+langchain-text-splitters>=1.0.0     # MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+langchain-openai>=1.1.0             # ChatOpenAI (Vision/LLM) + OpenAIEmbeddings
+langchain-mongodb>=0.11.0           # MongoDBAtlasVectorSearch
+pymongo-search-utils>=0.2.1         # required by langchain-mongodb>=0.11.0
+lark>=1.1.9,<2.0.0                  # required by langchain-mongodb>=0.11.0
 
 # ── File Connectors ───────────────────────────────────────────────────────────
 aiofiles>=24.1.0                    # async file reads — LocalConnector
-msgraph-sdk>=1.9.0                  # SharePoint via Microsoft Graph API (Phase 6)
-azure-identity>=1.19.0              # ClientSecretCredential for SharePoint auth (Phase 6)
+aiohttp>=3.9.0                      # async HTTP — SharePointConnector Graph API calls
+msgraph-sdk>=1.9.0                  # SharePoint via Microsoft Graph API
+azure-identity>=1.19.0              # ClientSecretCredential for SharePoint OAuth2
 
-# ── Structured Data Connectors (Phase 6b) ─────────────────────────────────────
+# ── Structured Data Connectors ────────────────────────────────────────────────
 sqlalchemy[asyncio]>=2.0.0          # async ORM + connection pooling for SQLConnector
 asyncpg>=0.30.0                     # PostgreSQL async driver (postgresql+asyncpg://)
 aiomysql>=0.2.0                     # MySQL async driver (mysql+aiomysql://)
-# pymongo already listed above — used by MongoDBConnector as well
+# pymongo already listed above — MongoDBConnector reuses it
 
 # ── Document Loaders ──────────────────────────────────────────────────────────
 pymupdf>=1.24.0                     # PDF: open + inspect pages (text chars, images)
-pymupdf4llm>=0.3.0                  # PDF: extract text → clean Markdown (no model downloads)
-markitdown[all]>=0.1.0              # DOCX / PPTX / XLSX → Markdown (Microsoft, offline)
-python-docx>=1.1.0  
-python-pptx>=1.0.0  
-# DOCX: inspect complexity (images, nested tables)
+pymupdf4llm>=0.3.0                  # PDF: extract text → clean Markdown
+markitdown>=0.1.5                   # DOCX/PPTX/XLSX → Markdown fallback
+python-docx>=1.1.0                  # DOCX: complexity inspection (images, nested tables)
+python-pptx>=1.0.0                  # PPTX: slide-aware extraction, tables, speaker notes
 # NOTE: docling removed — requires ~1.5GB HuggingFace model downloads at runtime,
 #       blocked by corporate firewall. Replaced by pymupdf4llm (text PDFs) +
-#       ChatOpenAI Vision via LangChain (scanned PDFs / embedded images).
+#       ChatOpenAI Vision (scanned PDFs / embedded images).
+
+# ── Security & Encryption ─────────────────────────────────────────────────────
+cryptography>=42.0.0                # Fernet AES encryption for tenant genai_api_key
+# Uncomment below when deploying to AKS with Azure Key Vault:
+# azure-keyvault-secrets>=4.7.0    # Key Vault secret fetch (production)
+# Note: azure-identity already listed above for SharePoint auth
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
-orjson>=3.10.0                      # fast JSON — used in connector hash computation
+orjson>=3.10.0                      # fast JSON — connector hash computation

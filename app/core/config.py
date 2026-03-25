@@ -25,11 +25,16 @@ class Settings(BaseSettings):
 
     # ── Redis ─────────────────────────────────────────────────────────────────
     REDIS_URI: RedisDsn = "redis://localhost:6379"  # type: ignore[assignment]
+    REDIS_PASSWORD: str | None = None  # Optional — set for Azure Redis Cache
     QUEUE_NAME: str = "ingestion_jobs"
 
     # ── OpenAI ────────────────────────────────────────────────────────────────
     OPENAI_API_KEY: str
     EMBEDDING_MODEL: str = "text-embedding-3-small"  # default, overridable per tenant
+    LLM_MODEL: str = "gpt-4.1-mini"  # default LLM for RAG + Vision
+    # ── Encryption ───────────────────────────────────────────────────────────
+    SECRET_ENCRYPTION_KEY: str | None = None  # Fernet key for tenant api_key decryption
+    KEY_VAULT_URL: str | None = None  # Azure Key Vault URL (production/AKS)
 
     # ── Computed: parsed from REDIS_URI, not set manually ─────────────────────
     @computed_field  # type: ignore[misc]

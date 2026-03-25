@@ -5,7 +5,8 @@ Design: stats accumulate in memory during the job (not one DB write per document
 One single MongoDB write happens at the end — efficient and atomic.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import structlog
 
 from app.repositories.job_repo import JobRepository
@@ -24,31 +25,71 @@ class JobStats:
     documents_failed: int = 0
     documents_deleted: int = 0
     chunks_created: int = 0
-    chunks_deleted: int = 0  # covers BOTH: old chunks from updates AND full deletions
+    chunks_deleted: int = 0
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
-    def record_document_result(self, result: dict) -> None:
-        """Update counters from a single document's pipeline result."""
+    # Document lists for full detail notifications
+    # Each entry: { source_id, file_name, full_path, source_url, chunks, metadata }
+    new_documents: list[dict] = field(default_factory=list)
+    updated_documents: list[dict] = field(default_factory=list)
+    deleted_documents: list[dict] = field(default_factory=list)
+    error_documents: list[dict] = field(default_factory=list)
+
+    def record_document_result(self, result: dict, raw_doc=None) -> None:
+        """Update counters + document lists from a single document result."""
         self.documents_scanned += 1
         status = result.get("status", "failed")
         chunks = result.get("chunks", 0)
         chunks_deleted = result.get("chunks_deleted", 0)
 
+        doc_info = self._build_doc_info(raw_doc, chunks=chunks) if raw_doc else {}
+
         if status == "new":
             self.documents_new += 1
             self.chunks_created += chunks
+            if doc_info:
+                self.new_documents.append(doc_info)
         elif status == "updated":
             self.documents_updated += 1
             self.chunks_created += chunks
-            self.chunks_deleted += chunks_deleted  # old chunks removed before re-embed
-
+            self.chunks_deleted += chunks_deleted
+            if doc_info:
+                self.updated_documents.append(
+                    {**doc_info, "chunks_deleted": chunks_deleted}
+                )
         elif status == "skipped":
             self.documents_skipped += 1
         elif status == "failed":
             self.documents_failed += 1
+            if doc_info:
+                self.error_documents.append(
+                    {**doc_info, "error": result.get("error", "")}
+                )
 
-    def record_deletion(self, chunks_deleted: int = 0) -> None:
+    def record_deletion(
+        self, chunks_deleted: int = 0, raw_doc=None, source_id: str = ""
+    ) -> None:
+        """Called when a whole document is deleted."""
         self.documents_deleted += 1
         self.chunks_deleted += chunks_deleted
+        doc_info = self._build_doc_info(raw_doc) if raw_doc else {}
+        if not doc_info and source_id:
+            doc_info = {"source_id": source_id}
+        if doc_info:
+            self.deleted_documents.append(doc_info)
+
+    @staticmethod
+    def _build_doc_info(raw_doc, chunks: int = 0) -> dict:
+        """Extract document info for notification payload."""
+        if raw_doc is None:
+            return {}
+        return {
+            "source_id": getattr(raw_doc, "source_id", ""),
+            "file_name": getattr(raw_doc, "file_name", ""),
+            "full_path": getattr(raw_doc, "full_path", ""),
+            "source_url": getattr(raw_doc, "source_url", ""),
+            "chunks": chunks,
+        }
 
     def to_dict(self) -> dict:
         return {
@@ -82,7 +123,6 @@ class JobLifecycleService:
         Mark job as completed or partial, write final stats in one DB operation.
         partial = job ran but some documents had errors.
         """
-
         await self._repo.mark_completed(
             job_id=job_id,
             stats=stats.to_dict(),
