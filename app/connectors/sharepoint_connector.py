@@ -17,7 +17,6 @@ import hashlib
 import time
 from datetime import datetime
 from typing import AsyncIterator, Optional
-from urllib.parse import quote
 
 import aiohttp
 import structlog
@@ -131,11 +130,9 @@ class SharePointConnector(BaseConnector):
         Deleted items yield DeltaItem(type="deleted", source_id=..., raw_doc=None).
         """
         start_url = (
-            self._ensure_select(
-                self._saved_delta_token
-            )  # delta scan — add $select if missing
+            self._saved_delta_token  # delta scan — use saved URL directly
             if self._saved_delta_token
-            else self._build_delta_url()  # full scan — $select already included
+            else self._build_delta_url()  # full scan
         )
 
         log.info(
@@ -147,7 +144,13 @@ class SharePointConnector(BaseConnector):
         async for item in self._paginate(start_url):
 
             # ── Deleted item ───────────────────────────────────────────────────
-            if item.get("@removed"):
+            # Deleted items — per Microsoft Graph API docs:
+            # driveItem delta returns deleted items with "deleted" facet.
+            # { "id": "...", "deleted": {} }
+            # NOT "@removed" — that is used by other Graph endpoints.
+            # Worker Step 4 guards via deduplicator.mark_deleted():
+            #   if existing_doc is None (file not in our scope) → skip safely
+            if item.get("deleted") is not None:
                 log.debug("sharepoint.item_deleted", item_id=item["id"])
                 yield DeltaItem(type="deleted", source_id=item["id"])
                 continue
@@ -155,6 +158,42 @@ class SharePointConnector(BaseConnector):
             # ── Skip folders ───────────────────────────────────────────────────
             if "folder" in item:
                 continue
+
+            # ── Filter by root_folder path ────────────────────────────────────
+            # Root-level delta returns ALL items in the drive.
+            # We only want items under our configured root_folder.
+            #
+            # SharePoint parentReference.path after stripping drive prefix:
+            #   "Shared Documents/docassist-test/XLOS/SPT/general"
+            #
+            # root_folder config: "docassist-test"
+            #
+            # We cannot use startswith() because SharePoint prepends
+            # the document library name ("Shared Documents/") to the path.
+            # Instead check if root_folder appears as a path segment.
+            if self._root_folder:
+                parent_path = (
+                    item.get("parentReference", {})
+                    .get("path", "")
+                    .split("root:")[-1]
+                    .strip("/")
+                )
+                item_path = (
+                    f"{parent_path}/{item.get('name', '')}"
+                    if parent_path
+                    else item.get("name", "")
+                )
+                # Normalize both paths for comparison
+                # Check if root_folder is a segment within the item path
+                # e.g. "docassist-test" in "Shared Documents/docassist-test/XLOS/..."
+                normalized_root = self._root_folder.strip("/")
+                normalized_path = item_path.strip("/")
+                if (
+                    normalized_path != normalized_root
+                    and f"/{normalized_root}/" not in f"/{normalized_path}/"
+                    and not normalized_path.startswith(f"{normalized_root}/")
+                ):
+                    continue  # outside our root_folder scope — skip
 
             # ── Build and filter RawDocument ───────────────────────────────────
             raw_doc = await self._item_to_raw_document(item)
@@ -222,10 +261,9 @@ class SharePointConnector(BaseConnector):
                 yield item
 
             if next_link := data.get("@odata.nextLink"):
-                # Ensure $select survives across pagination pages
-                url = self._ensure_select(next_link)
+                url = next_link
             elif delta_link := data.get("@odata.deltaLink"):
-                # Final page — save raw deltaLink (we apply _ensure_select on next run load)
+                # Final page — save deltaLink for next run
                 self._new_delta_token = delta_link
                 log.info("sharepoint.delta_link_captured")
                 url = None
@@ -241,43 +279,32 @@ class SharePointConnector(BaseConnector):
 
     # ── Item processing ────────────────────────────────────────────────────────
 
-    # Fields that must always be selected — @microsoft.graph.downloadUrl
-    # is NOT returned by default and must be explicitly requested.
-    _SELECT = (
-        "id,name,size,file,folder,parentReference,"
-        "webUrl,lastModifiedDateTime,eTag,"
-        "@microsoft.graph.downloadUrl"
-    )
-
-    @classmethod
-    def _ensure_select(cls, url: str) -> str:
-        """
-        Append $select to any Graph delta/nextLink URL if not already present.
-        Needed because:
-          - Saved deltaLink tokens from previous runs don't carry $select
-          - @odata.nextLink pages also lose $select if not in original request
-        """
-        if "$select" not in url:
-            sep = "&" if "?" in url else "?"
-            return f"{url}{sep}$select={cls._SELECT}"
-        return url
-
     def _build_delta_url(self) -> str:
+        """
+        Build the initial delta URL for a full scan.
+
+        Always uses ROOT-LEVEL delta regardless of root_folder config.
+
+        Why root-level instead of subfolder-scoped delta?
+          Subfolder-scoped delta (/drives/{id}/root:/{folder}:/delta) has an
+          inconsistency: deleted items inside the subfolder may not always
+          appear with the "deleted" facet in the response.
+
+          Root-level delta (/drives/{id}/root/delta) reliably returns
+          the "deleted" facet for any deleted file across the drive.
+          We filter by root_folder path in fetch_documents() instead.
+
+          Per official docs: driveItem delta returns deleted items with
+          "deleted" facet — { "id": "...", "deleted": {} }
+
+        NOTE: No $select — @microsoft.graph.downloadUrl is an OData instance
+        annotation not returned by the delta endpoint. Fetched per-item
+        via a plain GET in _get_download_url().
+        """
         base = (
             f"{GRAPH_BASE}/sites/{self._site_id}" f"/drives/{self._resolved_drive_id}"
         )
-        # $select must explicitly include @microsoft.graph.downloadUrl —
-        # Graph API does NOT return it by default. Without it every file
-        # gets skipped with "no_download_url".
-        select = (
-            "id,name,size,file,folder,parentReference,"
-            "webUrl,lastModifiedDateTime,eTag,"
-            "@microsoft.graph.downloadUrl"
-        )
-        if self._root_folder:
-            encoded = quote(self._root_folder, safe="/")
-            return f"{base}/root:/{encoded}:/delta?$select={select}"
-        return f"{base}/root/delta?$select={select}"
+        return f"{base}/root/delta"  # always root-level — filter by path in code
 
     async def _item_to_raw_document(self, item: dict) -> Optional[RawDocument]:
         """
@@ -312,15 +339,17 @@ class SharePointConnector(BaseConnector):
             )
             return None
 
-        # Download URL — pre-authenticated, no auth header needed
-        download_url: Optional[str] = item.get("@microsoft.graph.downloadUrl")
+        # Fetch download URL via separate GET — @microsoft.graph.downloadUrl
+        # is an OData annotation not returned by delta endpoint
+        item_id = item["id"]
+        download_url = await self._get_download_url(item_id)
         if not download_url:
             log.warning("sharepoint.skip", name=name, reason="no_download_url")
             return None
 
         # Download content
         try:
-            content = await self._download(download_url)
+            file_content = await self._download(download_url)
         except Exception as e:
             log.error("sharepoint.download_failed", name=name, error=str(e))
             return None
@@ -330,7 +359,7 @@ class SharePointConnector(BaseConnector):
         content_hash = (
             file_hashes.get("sha256Hash")
             or file_hashes.get("sha1Hash")
-            or hashlib.sha256(content).hexdigest()
+            or hashlib.sha256(file_content).hexdigest()
         )
 
         # full_path — strip drive prefix from parentReference.path
@@ -360,7 +389,7 @@ class SharePointConnector(BaseConnector):
             full_path=full_path,
             source_url=item.get("webUrl", ""),
             content_type="file",
-            content=content,
+            content=file_content,
             mime_type=mime_type,
             content_hash=content_hash,
             last_modified_at_source=last_modified,
@@ -372,6 +401,32 @@ class SharePointConnector(BaseConnector):
                 "size_bytes": size,
             },
         )
+
+    async def _get_download_url(self, item_id: str) -> str | None:
+        """
+        Fetch @microsoft.graph.downloadUrl via a separate GET on the item.
+
+        Why separate call:
+          @microsoft.graph.downloadUrl is an OData instance annotation —
+          NOT a standard driveItem property. The delta endpoint never returns
+          it. A plain GET on the item returns it automatically without
+          any $select parameter needed.
+
+        Returns None if the URL cannot be obtained (item inaccessible etc.).
+        """
+        url = (
+            f"{GRAPH_BASE}/sites/{self._site_id}"
+            f"/drives/{self._resolved_drive_id}"
+            f"/items/{item_id}"
+        )
+        try:
+            data = await self._graph_get(url)
+            return data.get("@microsoft.graph.downloadUrl")
+        except Exception as e:
+            log.warning(
+                "sharepoint.download_url_fetch_failed", item_id=item_id, error=str(e)
+            )
+            return None
 
     async def _download(self, url: str) -> bytes:
         """Download file content from pre-authenticated Graph download URL."""
