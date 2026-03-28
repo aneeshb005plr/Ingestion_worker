@@ -300,11 +300,13 @@ class SharePointConnector(BaseConnector):
         NOTE: No $select — @microsoft.graph.downloadUrl is an OData instance
         annotation not returned by the delta endpoint. Fetched per-item
         via a plain GET in _get_download_url().
+
+        URL pattern: /drives/{drive-id}/root/delta
+        Per Microsoft Q&A: /sites/{siteId}/drive/root/delta does NOT reliably
+        return deleted items. /drives/{drive-id}/root/delta does.
+        Reference: https://learn.microsoft.com/en-us/graph/api/driveitem-delta
         """
-        base = (
-            f"{GRAPH_BASE}/sites/{self._site_id}" f"/drives/{self._resolved_drive_id}"
-        )
-        return f"{base}/root/delta"  # always root-level — filter by path in code
+        return f"{GRAPH_BASE}/drives/{self._resolved_drive_id}/root/delta"
 
     async def _item_to_raw_document(self, item: dict) -> Optional[RawDocument]:
         """
@@ -414,11 +416,7 @@ class SharePointConnector(BaseConnector):
 
         Returns None if the URL cannot be obtained (item inaccessible etc.).
         """
-        url = (
-            f"{GRAPH_BASE}/sites/{self._site_id}"
-            f"/drives/{self._resolved_drive_id}"
-            f"/items/{item_id}"
-        )
+        url = f"{GRAPH_BASE}/drives/{self._resolved_drive_id}" f"/items/{item_id}"
         try:
             data = await self._graph_get(url)
             return data.get("@microsoft.graph.downloadUrl")
