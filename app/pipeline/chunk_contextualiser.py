@@ -23,6 +23,12 @@ Solution:
   LLM returns a 2-sentence contextual summary.
   Prepend it to the chunk text before embedding.
 
+R6b changes:
+  - Prompt updated to use ONLY visible window context (no hallucination)
+  - Abbreviation expansion removed (too risky for domain-specific terms)
+  - Structural context emphasis: section, heading, entity identification
+  - Works alongside R6a (document prefix) — complementary, not overlapping
+
 Result:
   The contact chunk now reads:
     "This section lists the primary and secondary application owners
@@ -69,11 +75,13 @@ for it using natural language questions.
 
 Rules:
 - Write exactly 2 sentences maximum
-- Use the surrounding context window to understand what the chunk is about
+- Use ONLY information visible in the surrounding context window
 - Use natural language that matches how users ask questions
-- Include the application name, topic, and key entities (names, roles, contacts)
+- Include the topic, section, and key entities (names, roles, numbers) visible in the window
 - Use common synonyms: "owner"/"primary contact", "support"/"escalation", \
 "config"/"settings", "steps"/"procedure", "team"/"group"
+- Do NOT expand abbreviations — keep them exactly as written in the document
+- Do NOT infer or add information not present in the visible window
 - Do NOT start with "This chunk" or "This section"
 - Return ONLY the 2 sentences, nothing else
 """
@@ -82,18 +90,22 @@ CHUNK_PROMPT = """\
 Document: {file_name}
 Section: {section_path}
 
-<context>
+<context_window>
 {window_context}
-</context>
+</context_window>
 
 Chunk to describe:
 <chunk>
 {chunk_text}
 </chunk>
 
-The <context> above shows the surrounding chunks from the same document. \
-Using this context, write 2 sentences describing what the <chunk> is about \
-and what questions it would answer.\
+The <context_window> above shows surrounding chunks from the SAME document.
+Using ONLY what is visible in the context window:
+- What section or topic does this chunk belong to?
+- What entities, roles, or key facts does it contain?
+- What question would a user ask to find this chunk?
+
+Write 2 sentences answering these. Keep all abbreviations exactly as written.\
 """
 
 
