@@ -283,6 +283,12 @@ async def process_ingestion_task(
         tenant_metadata_schema = tenant_config.get("metadata_schema")
         repo_metadata_overrides = repo_overrides.get("metadata_overrides")
 
+        # Retrieval config — used by DocumentPrefixBuilder (R6a)
+        # Tells prefix builder which fields are meaningful for this repo
+        retrieval_config = repo_config.get("retrieval_config", {})
+        extractable_fields = retrieval_config.get("extractable_fields", [])
+        filterable_fields = retrieval_config.get("filterable_fields", [])
+
         # ── Step 3: Connect to data source ────────────────────────────────────
         source_type = repo_config.get("source_type", "local")
         connector_config = repo_config.get("connector_config", {})
@@ -351,6 +357,8 @@ async def process_ingestion_task(
                     job_id=job_id,
                     tenant_metadata_schema=tenant_metadata_schema,
                     repo_metadata_overrides=repo_metadata_overrides,
+                    extractable_fields=extractable_fields,
+                    filterable_fields=filterable_fields,
                     embed_semaphore=embed_semaphore,
                 )
                 stats.record_document_result(result)

@@ -8,6 +8,7 @@ Pipeline (identical for ALL source types):
                      Structured: SQLLoader / MongoDBLoader
   3. Chunk         → Markdown → text segments
   4. Enrich        → attach metadata to every chunk
+  4.5 Prefix       → prepend document identity to chunk text (R6a)
   5. Embed         → text → float vectors
   6. Delete        → remove old chunks if this is an update
   7. Store         → vectors → MongoDB Atlas
@@ -26,6 +27,7 @@ from app.connectors.base import RawDocument
 from app.loaders.factory import LoaderFactory
 from app.pipeline.chunk_contextualiser import ChunkContextualiser
 from app.pipeline.chunker import Chunker
+from app.pipeline.document_prefix_builder import DocumentPrefixBuilder
 from app.pipeline.metadata_enricher import MetadataEnricher
 from app.pipeline.table_converter import TableConverter
 from app.pipeline.deduplicator import Deduplicator
@@ -62,6 +64,7 @@ class IngestionService:
         self._table_converter = TableConverter()
         self._enricher = MetadataEnricher()
         self._deduplicator = Deduplicator(document_repo)
+        self._prefix_builder = DocumentPrefixBuilder()
 
         # Contextual enrichment — LLM-based chunk context prepend
         # Uses same LLM as loader (loader_llm) — reuses tenant api_config.
@@ -97,6 +100,8 @@ class IngestionService:
         job_id: str,
         tenant_metadata_schema: dict | None = None,
         repo_metadata_overrides: list[dict] | None = None,
+        extractable_fields: list[str] | None = None,
+        filterable_fields: list[str] | None = None,
         embed_semaphore: Optional[asyncio.Semaphore] = None,
     ) -> dict:
         """
@@ -187,6 +192,31 @@ class IngestionService:
                 job_id=job_id,
                 tenant_metadata_schema=tenant_metadata_schema,
                 repo_metadata_overrides=repo_metadata_overrides,
+            )
+
+            # ── Step 4.5: Document identity prefix ───────────────────────────
+            # R6a: Prepend document identity to every chunk text BEFORE embedding.
+            # Runs AFTER metadata enrichment so all custom fields are available.
+            #
+            # Field priority (zero hardcoded field names — fully tenant-driven):
+            #   1. extractable_fields  → most curated, use first
+            #   2. filterable_fields   → fallback if no extractable
+            #   3. all custom metadata → fallback if neither configured
+            #
+            # "[Smart Pricing Tool | XLOS | SPT Runbook | Contact Information]
+            #  Role: Primary | Name: Brad Jorgenson..."
+            lc_chunks = self._prefix_builder.enrich_chunks(
+                chunks=lc_chunks,
+                file_name=raw_doc.file_name,
+                extractable_fields=extractable_fields or [],
+                filterable_fields=filterable_fields or [],
+            )
+            bound_log.debug(
+                "document.prefix_applied",
+                chunks=len(lc_chunks),
+                file=raw_doc.file_name,
+                used_extractable=bool(extractable_fields),
+                used_filterable=bool(filterable_fields and not extractable_fields),
             )
 
             # ── Step 5: Embed ─────────────────────────────────────────────────
