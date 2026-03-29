@@ -76,13 +76,15 @@ for it using natural language questions.
 Rules:
 - Write exactly 2 sentences maximum
 - Use ONLY information visible in the surrounding context window
+- Focus on WHAT THE CHUNK CONTAINS, not WHERE it appears in the document
+- Extract the key facts, values, names, technologies, decisions — not section numbers
 - Use natural language that matches how users ask questions
-- Include the topic, section, and key entities (names, roles, numbers) visible in the window
 - Use common synonyms: "owner"/"primary contact", "support"/"escalation", \
-"config"/"settings", "steps"/"procedure", "team"/"group"
+"technology"/"tech stack"/"framework", "config"/"settings", "steps"/"procedure"
 - Do NOT expand abbreviations — keep them exactly as written in the document
 - Do NOT infer or add information not present in the visible window
-- Do NOT start with "This chunk" or "This section"
+- Do NOT start with "This chunk", "This section", "This document", "This table"
+- Do NOT describe structure — extract meaning
 - Return ONLY the 2 sentences, nothing else
 """
 
@@ -100,12 +102,39 @@ Chunk to describe:
 </chunk>
 
 The <context_window> above shows surrounding chunks from the SAME document.
-Using ONLY what is visible in the context window:
-- What section or topic does this chunk belong to?
-- What entities, roles, or key facts does it contain?
-- What question would a user ask to find this chunk?
+Using ONLY what is visible in the context window, write 2 sentences that \
+capture the MEANING and KEY FACTS of this chunk.
 
-Write 2 sentences answering these. Keep all abbreviations exactly as written.\
+Focus on:
+- WHO or WHAT the chunk is about (names, systems, technologies, roles)
+- WHAT KEY FACTS it contains (values, decisions, configurations, contacts)
+- WHAT QUESTION a user would ask to find this specific chunk
+
+AVOID:
+- Describing section numbers or document structure
+- Saying "this section belongs to..."
+- Mentioning page numbers or heading hierarchy
+
+Examples:
+
+Table with technologies:
+  BAD:  "This section belongs to 3.2.1 List of components with brief description."
+  GOOD: "SPT application uses NodeJS for microservices, MongoDB for the database, \
+and Angular for the frontend. Users might ask what technology or tech stack the \
+SPT application is built on."
+
+Table with contacts:
+  BAD:  "This section lists application owners and escalation contacts."
+  GOOD: "Brad Jorgenson and Sheetal Shenoy are the primary application owners of \
+Smart Pricing Tool reachable at +1 214-984-9828 during 8am-5pm EST. Users might \
+ask who is the primary owner or contact for SPT."
+
+Prose about deployment:
+  BAD:  "This chunk belongs to the deployment section of the runbook."
+  GOOD: "SPT is deployed on Azure Kubernetes Service using Docker images from \
+artifacts-west.pwc.com. Users might ask how or where SPT is deployed."
+
+Keep all abbreviations exactly as written.\
 """
 
 
