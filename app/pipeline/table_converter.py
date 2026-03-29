@@ -110,51 +110,82 @@ class TableConverter:
 
     def _get_preceding_paragraph(self, result: list[str]) -> str:
         """
-        Get the last non-empty, non-heading paragraph from result lines.
-        This is the caption/description that precedes the table.
-        Only returns plain text paragraphs — not headings, not table rows.
+        Get the caption/description that immediately precedes the table.
+
+        Priority:
+          1. Last plain text paragraph before the table (ideal)
+          2. Last heading before the table (fallback when table immediately
+             follows a heading with no caption paragraph between them)
+
+        Why fall back to heading:
+          Many tables have this structure:
+            ### 3.2.1 List of components with brief description
+            | Component | Technology | Function |    ← no plain text between
+
+          Without fallback: preceding_context = "" → rows have no context
+          With fallback: preceding_context = "3.2.1 List of components..."
+          → each row embeds with meaningful context ✅
         """
+        last_heading = ""
         for line in reversed(result):
             stripped = line.strip()
             if not stripped:
                 continue
-            # Skip headings — they are already in breadcrumb
-            if stripped.startswith("#"):
-                continue
             # Skip italic/bold table captions like *Table 4: ...*
-            # These are post-table captions, not pre-table descriptions
             if stripped.startswith("*") and stripped.endswith("*"):
                 continue
             # Skip lines that are already table-converted prose
             if " | " in stripped and ":" in stripped:
                 continue
-            # This is a plain paragraph — return it
+            # Heading — save as fallback but keep looking for plain text
+            if stripped.startswith("#"):
+                if not last_heading:
+                    # Strip markdown # prefix to get clean text
+                    last_heading = stripped.lstrip("#").strip()
+                continue
+            # Plain text paragraph — best option, return immediately
             return stripped
-        return ""
+
+        # No plain text found — fall back to nearest heading
+        return last_heading
 
     def _remove_preceding_paragraph(self, result: list[str]) -> list[str]:
         """
-        Remove the last non-empty paragraph from result.
-        Called after we prepend it to the first table row.
-        Must mirror _get_preceding_paragraph exactly:
-          empty lines    → continue (skip)
-          headings (#)   → continue (skip — heading is not the caption)
-          italic (*...*) → continue (skip — post-table caption, keep)
-          table prose    → continue (skip — already converted rows)
-          plain text     → remove it and return
+        Remove the preceding context line from result after prepending to table rows.
+        Mirrors _get_preceding_paragraph priority exactly:
+          1. Remove plain text paragraph if found
+          2. Remove heading if it was used as fallback context
+
+        Why remove the heading fallback:
+          When heading is used as preceding_context, it gets prepended to
+          every table row. Leaving it in result would cause duplication —
+          the heading would appear both as a standalone line AND embedded
+          in each row's context.
+
+          Note: we only remove the heading if no plain text was found first,
+          mirroring the exact fallback path of _get_preceding_paragraph.
         """
+        last_heading_idx = None
         for i in range(len(result) - 1, -1, -1):
             stripped = result[i].strip()
             if not stripped:
                 continue
-            if stripped.startswith("#"):
-                continue  # skip heading — caption is before it
             if stripped.startswith("*") and stripped.endswith("*"):
-                continue  # skip italic post-table caption
+                continue
             if " | " in stripped and ":" in stripped:
-                continue  # skip already-converted table prose
+                continue
+            if stripped.startswith("#"):
+                # Remember this heading index but keep looking for plain text
+                if last_heading_idx is None:
+                    last_heading_idx = i
+                continue
+            # Plain text found — remove it and return
             result[i] = ""
             return result
+
+        # No plain text found — remove the heading that was used as fallback
+        if last_heading_idx is not None:
+            result[last_heading_idx] = ""
         return result
 
     def _convert_table(
