@@ -204,8 +204,24 @@ class TableConverter:
                         parts.append(cell)
             if parts:
                 prose_row = " | ".join(parts)
-                # Prepend context to FIRST row only
-                if idx == 0 and preceding_context:
+                # Prepend context to EVERY row — not just the first.
+                #
+                # Why every row:
+                #   After table conversion, all rows land in a single chunk
+                #   because they fit within chunk_size together.
+                #   The embedding of that chunk is diluted across all rows.
+                #
+                #   Query "who is the primary owner?" against a chunk
+                #   with 3 contacts scores LOW because the vector represents
+                #   ALL contacts equally — no single person "wins".
+                #
+                #   With context on every row, the chunker can split them
+                #   as individual self-contained units, each scoring HIGH
+                #   for their specific content.
+                #
+                #   Even if chunker keeps them together, each row now carries
+                #   its own context so the embedding is richer per row.
+                if preceding_context:
                     prose_row = f"{preceding_context} — {prose_row}"
                 output.append(prose_row)
 
