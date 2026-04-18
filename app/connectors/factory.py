@@ -11,7 +11,9 @@ import structlog
 
 from app.connectors.base import BaseConnector
 from app.connectors.local_connector import LocalConnector
-from app.connectors.sharepoint import SharePointConnector
+from app.connectors.sharepoint_connector import SharePointConnector
+from app.connectors.onedrive_connector import OneDriveConnector
+from app.connectors.azure_blob_connector import AzureBlobConnector
 from app.connectors.mongodb_connector import MongoDBConnector
 from app.connectors.sql_connector import SQLConnector
 from app.core.encryption import decrypt_credentials
@@ -22,9 +24,17 @@ log = structlog.get_logger(__name__)
 _REGISTRY: dict[str, type[BaseConnector]] = {
     "local": LocalConnector,
     "sharepoint": SharePointConnector,
+    "onedrive": OneDriveConnector,
+    "azure_blob": AzureBlobConnector,
     "mongodb": MongoDBConnector,
     "sql": SQLConnector,
 }
+
+# Connectors that use delta_token for incremental scans
+_DELTA_TOKEN_CONNECTORS = {"sharepoint", "onedrive"}
+
+# Connectors that use last_run_at for incremental scans
+_LAST_RUN_AT_CONNECTORS = {"sql", "mongodb", "azure_blob"}
 
 
 async def get_connector(
@@ -51,7 +61,8 @@ async def get_connector(
 
     Raises ValueError for unknown source types.
     """
-    connector_class = _REGISTRY.get(source_type.lower())
+    source_type_lower = source_type.lower()
+    connector_class = _REGISTRY.get(source_type_lower)
     if connector_class is None:
         supported = list(_REGISTRY.keys())
         raise ValueError(
@@ -65,20 +76,36 @@ async def get_connector(
     log.info("connector.selected", source_type=source_type)
 
     # SharePoint needs delta_token for incremental scans
-    if source_type.lower() == "sharepoint":
+    if source_type_lower in _DELTA_TOKEN_CONNECTORS:
         return connector_class(
             config=connector_config,
             credentials=decrypted_creds,
             delta_token=delta_token,
         )
+    # Azure Blob uses last_run_at for delta detection
+    if source_type_lower == "azure_blob":
+        return connector_class(
+            config=connector_config,
+            credentials=decrypted_creds,
+            last_run_at=last_run_at,
+        )
 
-    connector = connector_class(
+    # SQL and MongoDB use last_run_at
+    if source_type_lower in {"sql", "mongodb"}:
+        return connector_class(
+            config=connector_config,
+            credentials=decrypted_creds,
+            last_run_at=last_run_at,
+        )
+
+    # Default (local connector — no delta support)
+    return connector_class(
         config=connector_config,
         credentials=decrypted_creds,
     )
 
-    # SQL and MongoDB need last_run_at for delta fetch (WHERE updated_at > last_run_at)
-    if last_run_at is not None and hasattr(connector, "last_run_at"):
-        connector.last_run_at = last_run_at
+    # # SQL and MongoDB need last_run_at for delta fetch (WHERE updated_at > last_run_at)
+    # if last_run_at is not None and hasattr(connector, "last_run_at"):
+    #     connector.last_run_at = last_run_at
 
-    return connector
+    # return connector

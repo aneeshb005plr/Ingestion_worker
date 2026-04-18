@@ -30,6 +30,7 @@ aiofiles>=24.1.0                    # async file reads — LocalConnector
 aiohttp>=3.9.0                      # async HTTP — SharePointConnector Graph API calls
 msgraph-sdk>=1.9.0                  # SharePoint via Microsoft Graph API
 azure-identity>=1.19.0              # ClientSecretCredential for SharePoint OAuth2
+azure-storage-blob[aio]>=12.24.0    # AzureBlobConnector — latest stable (service version 2025-11-05)
 
 # ── Structured Data Connectors ────────────────────────────────────────────────
 sqlalchemy[asyncio]>=2.0.0          # async ORM + connection pooling for SQLConnector
