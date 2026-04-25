@@ -284,15 +284,15 @@ async def process_ingestion_task(
 
         # ── Resolve metadata_schema — repo level takes priority ───────────────
         # Priority:
-        #   1. repo.metadata_schema     → repo-specific structure (new)
+        #   1. repo.metadata_schema     → repo-specific structure (recommended)
         #   2. tenant.metadata_schema   → tenant default (backward compatible)
         #   3. None                     → no custom metadata extraction
         #
-        # repo_metadata_overrides kept for backward compatibility
-        # but repo.metadata_schema is the preferred approach going forward.
+        # metadata_overrides (old workaround) removed in v10.0.
+        # Repos that need different field definitions should use
+        # repo.metadata_schema directly — cleaner and explicit.
         repo_metadata_schema = repo_config.get("metadata_schema")
         tenant_metadata_schema = tenant_config.get("metadata_schema")
-        repo_metadata_overrides = repo_overrides.get("metadata_overrides")
 
         # Use repo schema if defined, otherwise fall back to tenant schema
         effective_metadata_schema = repo_metadata_schema or tenant_metadata_schema
@@ -376,7 +376,6 @@ async def process_ingestion_task(
                     repo_id=repo_id,
                     job_id=job_id,
                     tenant_metadata_schema=effective_metadata_schema,
-                    repo_metadata_overrides=repo_metadata_overrides,
                     extractable_fields=extractable_fields,
                     filterable_fields=filterable_fields,
                     embed_semaphore=embed_semaphore,

@@ -3,23 +3,25 @@ MetadataEnricher — attaches rich metadata to every chunk.
 
 Two layers:
   1. Standard metadata — always present on every chunk regardless of tenant
-  2. Custom metadata  — tenant-defined fields extracted from path/properties
+  2. Custom metadata   — fields extracted per document using metadata_schema
 
-Custom field resolution (two-level merge):
-  Level 1 — tenant metadata_schema — defines fields for ALL repos under tenant
-  Level 2 — repo metadata_overrides — overrides specific fields for ONE repo
+Custom field resolution (resolved by worker BEFORE calling enricher):
+  Priority:
+    repo.metadata_schema   → takes priority (repo-specific structure)
+    tenant.metadata_schema → fallback (shared default)
+    None                   → no custom metadata
 
-  Merge rule:
-    Start with tenant custom_fields list
-    For each repo override: replace matching field_name, or append if new
-    Result = effective_fields used for this specific document
+  Worker resolves priority and passes ONE effective schema here.
+  No merging or override logic needed in enricher — keeps it simple.
 
-  Example:
-    Tenant defines: access_group at path_segment_index=2
-    Repo C needs:   access_group at path_segment_index=1 (different path structure)
-    → repo_metadata_overrides = [{ field_name: access_group, index: 1 }]
-    → effective access_group uses index=1 for this repo only
-    → all other fields (domain, application, is_general) unchanged from tenant
+Field sources supported:
+  path_segment:        Extract folder name at path_segment_index
+  file_name:           Use file stem without extension
+  static:              Same value for all docs (via default)
+  path_segment_equals: Boolean flag based on path segment match
+  computed:            Derive from other fields via formula
+                       e.g. "{application}::{access_group}" → "SPT::general"
+                       computed fields must be defined LAST in custom_fields list
 """
 
 from datetime import datetime, timezone
@@ -43,7 +45,6 @@ class MetadataEnricher:
         repo_id: str,
         job_id: str,
         tenant_metadata_schema: dict | None = None,
-        repo_metadata_overrides: list[dict] | None = None,
     ) -> list[Document]:
         """
         Attach standard + custom metadata to every chunk.
@@ -55,18 +56,16 @@ class MetadataEnricher:
             tenant_id:                Tenant identifier
             repo_id:                  Repo identifier
             job_id:                   Current ingestion job ID
-            tenant_metadata_schema:   Tenant-level custom field definitions
-            repo_metadata_overrides:  Repo-level overrides for specific fields
-                                      Matched by field_name, replaces tenant definition
+            tenant_metadata_schema:   Effective schema — already resolved by worker.
+                                      Priority: repo.metadata_schema > tenant.metadata_schema
+                                      Passed as single resolved schema — no merging needed here.
         """
         total_chunks = len(chunks)
         now = datetime.now(timezone.utc)
 
-        # Resolve effective custom fields once — same for all chunks in this doc
-        effective_schema = self._resolve_effective_schema(
-            tenant_metadata_schema=tenant_metadata_schema,
-            repo_metadata_overrides=repo_metadata_overrides,
-        )
+        # Schema is already resolved by worker (repo > tenant priority)
+        # No merging needed — use directly
+        effective_schema = tenant_metadata_schema
 
         for i, chunk in enumerate(chunks):
             # ── Standard metadata — always present ────────────────────────────
@@ -112,78 +111,6 @@ class MetadataEnricher:
                 chunk.metadata = {**custom, **chunk.metadata}
 
         return chunks
-
-    # ── Schema resolution ─────────────────────────────────────────────────────
-
-    def _resolve_effective_schema(
-        self,
-        tenant_metadata_schema: dict | None,
-        repo_metadata_overrides: list[dict] | None,
-    ) -> dict | None:
-        """
-        Merge tenant schema + repo overrides into effective schema.
-
-        Rules:
-          - Start with tenant custom_fields list
-          - For each repo override: replace field with same field_name
-          - New field_names in overrides are APPENDED (repo-specific fields)
-          - Fields only in tenant schema are kept unchanged
-          - If no tenant schema and no overrides: return None
-
-        Returns:
-          dict in same format as tenant_metadata_schema
-          { "custom_fields": [...] }
-        """
-        tenant_fields: list[dict] = []
-        if tenant_metadata_schema:
-            tenant_fields = list(tenant_metadata_schema.get("custom_fields", []))
-
-        if not repo_metadata_overrides:
-            # No overrides — use tenant schema as-is
-            return tenant_metadata_schema if tenant_fields else None
-
-        # Build override map: field_name → override definition
-        override_map = {
-            o.get("field_name"): o
-            for o in repo_metadata_overrides
-            if o.get("field_name")
-        }
-
-        if not override_map:
-            return tenant_metadata_schema if tenant_fields else None
-
-        # Apply overrides to tenant fields
-        effective: list[dict] = []
-        tenant_field_names: set[str] = set()
-
-        for field_def in tenant_fields:
-            field_name = field_def.get("field_name")
-            if field_name in override_map:
-                # Replace with repo-specific definition
-                effective.append(override_map[field_name])
-                log.debug(
-                    "metadata_enricher.field_overridden",
-                    field=field_name,
-                )
-            else:
-                # Keep tenant definition unchanged
-                effective.append(field_def)
-            if field_name:
-                tenant_field_names.add(field_name)
-
-        # Append repo-only fields (not in tenant schema)
-        for field_name, override in override_map.items():
-            if field_name not in tenant_field_names:
-                effective.append(override)
-                log.debug(
-                    "metadata_enricher.repo_only_field_added",
-                    field=field_name,
-                )
-
-        if not effective:
-            return None
-
-        return {"custom_fields": effective}
 
     # ── Custom field extraction ───────────────────────────────────────────────
 

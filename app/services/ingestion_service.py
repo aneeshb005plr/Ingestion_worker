@@ -99,7 +99,6 @@ class IngestionService:
         repo_id: str,
         job_id: str,
         tenant_metadata_schema: dict | None = None,
-        repo_metadata_overrides: list[dict] | None = None,
         extractable_fields: list[str] | None = None,
         filterable_fields: list[str] | None = None,
         embed_semaphore: Optional[asyncio.Semaphore] = None,
@@ -191,20 +190,20 @@ class IngestionService:
                 repo_id=repo_id,
                 job_id=job_id,
                 tenant_metadata_schema=tenant_metadata_schema,
-                repo_metadata_overrides=repo_metadata_overrides,
             )
 
             # ── Step 4.5: Document identity prefix ───────────────────────────
             # R6a: Prepend document identity to every chunk text BEFORE embedding.
             # Runs AFTER metadata enrichment so all custom fields are available.
             #
-            # Field priority (zero hardcoded field names — fully tenant-driven):
-            #   1. extractable_fields  → most curated, use first
-            #   2. filterable_fields   → fallback if no extractable
-            #   3. all custom metadata → fallback if neither configured
+            # Why needed:
+            #   Chunks have no application name in text after splitting.
+            #   Query "SPT owner" needs "Smart Pricing Tool" in chunk text
+            #   to match via embedding — filter scopes the search but
+            #   embedding still needs the vocabulary bridge.
             #
             # "[Smart Pricing Tool | XLOS | SPT Runbook | Contact Information]
-            #  Role: Primary | Name: Brad Jorgenson..."
+            #  Brad Jorgenson is the primary application owner..."
             lc_chunks = self._prefix_builder.enrich_chunks(
                 chunks=lc_chunks,
                 file_name=raw_doc.file_name,
