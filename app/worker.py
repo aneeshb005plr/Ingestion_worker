@@ -190,9 +190,10 @@ async def process_ingestion_task(
             "contextual_enrichment_concurrency", 3
         )
 
-        # Resolve vector index name for this repo
+        # Resolve vector index name and collection name for this repo
         vector_config = repo_config.get("vector_config", {})
         index_name = vector_config.get("index_name", f"vidx_repo_{repo_id}")
+        collection_name = vector_config.get("collection_name", "vector_store")
 
         # ── Step 2: Build per-task services ───────────────────────────────────
         # VectorStore and IngestionService are per-task — they need the
@@ -266,6 +267,7 @@ async def process_ingestion_task(
             db=db,
             index_name=index_name,
             lc_embeddings=task_embedding_provider.as_langchain_embeddings(),
+            collection_name=collection_name,
         )
 
         ingestion_service = IngestionService(
@@ -280,8 +282,26 @@ async def process_ingestion_task(
             contextual_enrichment_concurrency=contextual_enrichment_concurrency,
         )
 
+        # ── Resolve metadata_schema — repo level takes priority ───────────────
+        # Priority:
+        #   1. repo.metadata_schema     → repo-specific structure (new)
+        #   2. tenant.metadata_schema   → tenant default (backward compatible)
+        #   3. None                     → no custom metadata extraction
+        #
+        # repo_metadata_overrides kept for backward compatibility
+        # but repo.metadata_schema is the preferred approach going forward.
+        repo_metadata_schema = repo_config.get("metadata_schema")
         tenant_metadata_schema = tenant_config.get("metadata_schema")
         repo_metadata_overrides = repo_overrides.get("metadata_overrides")
+
+        # Use repo schema if defined, otherwise fall back to tenant schema
+        effective_metadata_schema = repo_metadata_schema or tenant_metadata_schema
+
+        bound_log.debug(
+            "task.metadata_schema_resolved",
+            source="repo" if repo_metadata_schema else "tenant",
+            has_schema=effective_metadata_schema is not None,
+        )
 
         # Retrieval config — used by DocumentPrefixBuilder (R6a)
         # Tells prefix builder which fields are meaningful for this repo
@@ -355,7 +375,7 @@ async def process_ingestion_task(
                     tenant_id=tenant_id,
                     repo_id=repo_id,
                     job_id=job_id,
-                    tenant_metadata_schema=tenant_metadata_schema,
+                    tenant_metadata_schema=effective_metadata_schema,
                     repo_metadata_overrides=repo_metadata_overrides,
                     extractable_fields=extractable_fields,
                     filterable_fields=filterable_fields,
@@ -412,19 +432,24 @@ async def process_ingestion_task(
                 repo_id=repo_id,
                 seen_source_ids=seen_source_ids,
             )
-            for source_id in deleted_ids:
-                deleted_chunks = await vector_store.delete_by_source(
-                    source_id=source_id,
-                    tenant_id=tenant_id,
-                    repo_id=repo_id,
-                )
-                await document_repo.mark_deleted(
-                    tenant_id=tenant_id,
-                    repo_id=repo_id,
-                    source_id=source_id,
-                )
-                stats.record_deletion(chunks_deleted=deleted_chunks)
-                bound_log.info("document.deleted", source_id=source_id)
+
+        for source_id in deleted_ids:
+            deleted_chunks = await vector_store.delete_by_source(
+                source_id=source_id,
+                tenant_id=tenant_id,
+                repo_id=repo_id,
+            )
+            await document_repo.mark_deleted(
+                tenant_id=tenant_id,
+                repo_id=repo_id,
+                source_id=source_id,
+            )
+            stats.record_deletion(chunks_deleted=deleted_chunks)
+            bound_log.info(
+                "document.deleted",
+                source_id=source_id,
+                chunks_deleted=deleted_chunks,
+            )
 
         # ── Step 6: Persist run state ─────────────────────────────────────────
         # SharePoint: save deltaLink for incremental next scan

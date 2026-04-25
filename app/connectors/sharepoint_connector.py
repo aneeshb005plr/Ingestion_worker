@@ -183,11 +183,11 @@ class SharePointConnector(BaseConnector):
                     if parent_path
                     else item.get("name", "")
                 )
-                # Normalize both paths for comparison
-                # Check if root_folder is a segment within the item path
-                # e.g. "docassist-test" in "Shared Documents/docassist-test/XLOS/..."
-                normalized_root = self._root_folder.strip("/")
-                normalized_path = item_path.strip("/")
+                # Normalize both paths for comparison — case-insensitive
+                # SharePoint folder names may have different casing
+                # e.g. "DocAssist-Test" vs "docassist-test" should match
+                normalized_root = self._root_folder.strip("/").lower()
+                normalized_path = item_path.strip("/").lower()
                 if (
                     normalized_path != normalized_root
                     and f"/{normalized_root}/" not in f"/{normalized_path}/"

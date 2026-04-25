@@ -256,6 +256,38 @@ class MetadataEnricher:
                     segment = path_parts[index] if index < len(path_parts) else ""
                     value = true_value if segment == match_value else false_value
 
+                elif source == "computed":
+                    # Derive value from other already-extracted fields
+                    # using a formula template string.
+                    #
+                    # formula: "{application}::{access_group}"
+                    # custom so far: { application: "SPT", access_group: "general" }
+                    # result: "Smart Pricing Tool::general"
+                    #
+                    # IMPORTANT: computed fields must be defined AFTER
+                    # the fields they reference in custom_fields list.
+                    # We use `custom` dict built so far — earlier fields available.
+                    formula = field_def.get("formula", "")
+                    if not formula:
+                        value = default
+                    else:
+                        try:
+                            # Replace {field_name} with extracted value
+                            # Falls back to default if referenced field missing
+                            value = formula
+                            import re
+
+                            placeholders = re.findall(r"\{(\w+)\}", formula)
+                            for placeholder in placeholders:
+                                field_value = custom.get(placeholder, "")
+                                if not field_value or field_value == "unknown":
+                                    # Referenced field missing → use default
+                                    value = default
+                                    break
+                                value = value.replace(f"{{{placeholder}}}", field_value)
+                        except Exception:
+                            value = default
+
                 else:
                     log.warning(
                         "metadata.unknown_source",
